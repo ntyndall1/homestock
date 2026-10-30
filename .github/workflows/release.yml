@@ -5,6 +5,11 @@ name: Release
 # install files to the release. The installer verifies signatures against this workflow's
 # identity (.github/workflows/release.yml at the release tag), so keep this file's path stable.
 # A manual run publishes and signs a commit-SHA image tag only.
+#
+# Signing uploads to Sigstore's public transparency log (Rekor), which occasionally records an
+# entry but times out answering; cosign then retries and fails with 409 "an equivalent entry
+# already exists". Each signing step therefore retries, with a fresh certificate each time, and
+# checks the result the way the installer will.
 
 on:
   release:
@@ -56,6 +61,16 @@ jobs:
           echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "IMAGE=$image" >> "$GITHUB_ENV"
 
+      - name: Work out the version
+        id: version
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # The release tag's version, shown in the app; a manual run is a development build.
+          if [[ -n "$TAG" ]]; then version="${TAG#v}"; else version="0.0.0-dev+${GITHUB_SHA::7}"; fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]] || { echo "not a version: $version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       - name: Generate image labels
         id: meta
         uses: docker/metadata-action@v6
@@ -80,6 +95,7 @@ jobs:
           file: ./Dockerfile
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: HOMESTOCK_VERSION=${{ steps.version.outputs.version }}
           outputs: type=image,name=${{ steps.image.outputs.image }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
@@ -169,7 +185,20 @@ jobs:
       - name: Sign image
         env:
           DIGEST: ${{ steps.index.outputs.digest }}
-        run: cosign sign --yes --recursive "$IMAGE@$DIGEST"
+        run: |
+          # The index is what installs pull and verify, and it pins each platform's image by
+          # digest, so its signature covers them (see the retry note at the top).
+          identity="https://github.com/$GITHUB_WORKFLOW_REF"
+          for attempt in 1 2 3; do
+            cosign sign --yes "$IMAGE@$DIGEST" || true
+            if cosign verify "$IMAGE@$DIGEST" --certificate-identity "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com >/dev/null; then
+              exit 0
+            fi
+            echo "::warning::signing attempt $attempt did not produce a valid signature"
+            sleep $((attempt * 20))
+          done
+          exit 1
 
   install-files:
     name: Attach signed install files to the release
@@ -201,8 +230,20 @@ jobs:
       - name: Sign install files
         working-directory: dist
         run: |
+          identity="https://github.com/$GITHUB_WORKFLOW_REF"
           for file in *.tar.gz install.sh SHA256SUMS; do
-            cosign sign-blob --yes --bundle "$file.sigstore.json" "$file"
+            for attempt in 1 2 3; do
+              rm -f -- "$file.sigstore.json"
+              cosign sign-blob --yes --bundle "$file.sigstore.json" "$file" || true
+              if [[ -s "$file.sigstore.json" ]] && cosign verify-blob --bundle "$file.sigstore.json" \
+                --certificate-identity "$identity" \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com "$file" >/dev/null; then
+                continue 2
+              fi
+              echo "::warning::signing $file, attempt $attempt, did not produce a valid bundle"
+              sleep $((attempt * 20))
+            done
+            exit 1
           done
 
       - name: Upload to the release

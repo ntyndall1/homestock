@@ -14,6 +14,8 @@ COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
 COPY templates ./templates
+# The version shown in the app; the release workflow passes the release tag's version.
+ARG HOMESTOCK_VERSION=0.0.0-dev
 RUN cargo build --release --locked
 
 FROM debian:trixie-slim

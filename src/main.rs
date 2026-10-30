@@ -14,7 +14,13 @@ mod security;
 use cli::Command;
 use std::{net::SocketAddr, process::ExitCode, sync::Arc, time::Duration};
 
-pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The release this binary was built for, shown in the page footer. Release builds set
+/// HOMESTOCK_VERSION from the release tag (see the Dockerfile and release workflow); any other
+/// build is marked as a development build.
+pub const APP_VERSION: &str = match option_env!("HOMESTOCK_VERSION") {
+    Some(version) => version,
+    None => "0.0.0-dev",
+};
 
 #[derive(Clone)]
 pub struct AppState {
